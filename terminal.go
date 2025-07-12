@@ -5,21 +5,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
-	"strings"
-	"syscall"
-
-	"golang.org/x/term"
-
 	"github.com/gotd/td/telegram/auth"
 	"github.com/gotd/td/tg"
+	"os"
+	"strings"
 )
 
-// Terminal implements auth.UserAuthenticator prompting the terminal for
-// input.
-//
-// This is only example implementation, you should not use it in your code.
-// Copy it and modify to fit your needs.
 type Terminal struct {
 	PhoneNumber string // optional, will be prompted if empty
 }
@@ -55,9 +46,9 @@ func (a Terminal) Phone(_ context.Context) (string, error) {
 
 func (Terminal) Password(_ context.Context) (string, error) {
 	fmt.Print("Enter 2FA password: ")
-	bytePwd, err := term.ReadPassword(int(syscall.Stdin))
+	password, err := bufio.NewReader(os.Stdin).ReadString('\n')
 	if err != nil {
 		return "", err
 	}
-	return strings.TrimSpace(string(bytePwd)), nil
+	return strings.TrimSpace(password), nil
 }

@@ -4,6 +4,10 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"github.com/gotd/td/telegram/auth/qrlogin"
+	"github.com/gotd/td/tgerr"
+	"golang.org/x/term"
+	"math/rand"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -19,24 +23,24 @@ import (
 	"github.com/gotd/contrib/middleware/ratelimit"
 	"github.com/gotd/contrib/pebble"
 	"github.com/gotd/contrib/storage"
-	"github.com/joho/godotenv"
-	"go.etcd.io/bbolt"
-	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
-	"golang.org/x/time/rate"
-	lj "gopkg.in/natefinch/lumberjack.v2"
-
 	"github.com/gotd/td/telegram"
-	"github.com/gotd/td/telegram/auth"
 	"github.com/gotd/td/telegram/downloader"
 	"github.com/gotd/td/telegram/query"
 	"github.com/gotd/td/telegram/updates"
 	"github.com/gotd/td/telegram/uploader"
 	"github.com/gotd/td/tg"
+	"github.com/jedib0t/go-pretty/v6/text"
+	"github.com/joho/godotenv"
+	"github.com/skip2/go-qrcode"
+	"go.etcd.io/bbolt"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"golang.org/x/time/rate"
+	lj "gopkg.in/natefinch/lumberjack.v2"
 )
 
 var (
-	workChat int64 // ID рабочего чата
+	workChat int64
 )
 
 func sessionFolder(phone string) string {
@@ -47,6 +51,64 @@ func sessionFolder(phone string) string {
 		}
 	}
 	return "phone-" + string(out)
+}
+
+func messageHandler(msg *tg.Message, api *tg.Client, e tg.Entities) error {
+	// Проверка, что сообщение из рабочего чата
+	if peerID, ok := msg.PeerID.(*tg.PeerChannel); ok && peerID.ChannelID == workChat {
+		// Обработка аудиофайлов
+		if media, ok := msg.Media.(*tg.MessageMediaDocument); ok {
+			if doc, ok := media.Document.(*tg.Document); ok {
+				if isAudioFile(doc) {
+					fileName := getFileName(doc)
+					fmt.Printf("Filename: %s\n", fileName)
+					if strings.HasSuffix(strings.ToLower(fileName), ".mp3") {
+						// Обработка MP3
+						downloadPath := fmt.Sprintf("downloads/%d.mp3", doc.ID)
+						if _, err := downloadFile(api, doc, downloadPath); err != nil {
+							return errors.Wrap(err, "download mp3")
+						}
+						fmt.Printf("Download path: %s\n", downloadPath)
+						oggPath := fmt.Sprintf("ogg_files/%d.ogg", doc.ID)
+						if err := convertMp3ToOgg(downloadPath, oggPath); err != nil {
+							return errors.Wrap(err, "convert mp3 to ogg")
+						}
+						fmt.Printf("Ogg path: %s\n", oggPath)
+						if err := sendVoice(api, e, workChat, oggPath); err != nil {
+							return errors.Wrap(err, "send voice")
+						}
+					} else if strings.HasSuffix(strings.ToLower(fileName), ".ogg") {
+						// Обработка OGG
+						oggPath := fmt.Sprintf("ogg_files/%d.ogg", doc.ID)
+						if _, err := downloadFile(api, doc, oggPath); err != nil {
+							return errors.Wrap(err, "download ogg")
+						}
+						if err := sendVoice(api, e, workChat, oggPath); err != nil {
+							return errors.Wrap(err, "send voice")
+						}
+					}
+				}
+			}
+		}
+
+		// Обработка ответов на голосовые сообщения
+		if reply, ok := msg.ReplyTo.(*tg.MessageReplyHeader); ok && msg.Message != "" {
+			repliedMsg, err := getMessage(api, e, reply.ReplyToMsgID)
+			if err != nil {
+				return errors.Wrap(err, "get replied message")
+			}
+			if repliedMedia, ok := repliedMsg.Media.(*tg.MessageMediaDocument); ok {
+				if repliedDoc, ok := repliedMedia.Document.(*tg.Document); ok {
+					if isVoiceMessage(repliedDoc) {
+						if err := sendVoiceWithCaption(api, e, workChat, repliedDoc, msg.Message, msg.Entities); err != nil {
+							return errors.Wrap(err, "send voice with caption")
+						}
+					}
+				}
+			}
+		}
+	}
+	return nil
 }
 
 func run(ctx context.Context) error {
@@ -61,10 +123,6 @@ func run(ctx context.Context) error {
 		return errors.Wrap(err, "load env")
 	}
 
-	phone := os.Getenv("TG_PHONE")
-	if phone == "" {
-		return errors.New("no phone")
-	}
 	appID, err := strconv.Atoi(os.Getenv("APP_ID"))
 	if err != nil {
 		return errors.Wrap(err, "parse app id")
@@ -83,7 +141,7 @@ func run(ctx context.Context) error {
 	}
 
 	// Настройка сессии
-	sessionDir := filepath.Join("session", sessionFolder(phone))
+	sessionDir := filepath.Join("session", sessionFolder("111"))
 	if err := os.MkdirAll(sessionDir, 0700); err != nil {
 		return err
 	}
@@ -145,74 +203,74 @@ func run(ctx context.Context) error {
 	client := telegram.NewClient(appID, appHash, options)
 	api := client.API()
 
-	// Обработчик новых сообщений
-	dispatcher.OnNewMessage(func(ctx context.Context, e tg.Entities, u *tg.UpdateNewMessage) error {
+	dispatcher.OnNewChannelMessage(func(ctx context.Context, e tg.Entities, u *tg.UpdateNewChannelMessage) error {
 		msg, ok := u.Message.(*tg.Message)
-		if !ok || msg.Out {
+		if !ok {
 			return nil
 		}
 
-		// Проверка, что сообщение из рабочего чата
-		if peerID, ok := msg.PeerID.(*tg.PeerChat); ok && peerID.ChatID == workChat {
-			// Обработка аудиофайлов
-			if media, ok := msg.Media.(*tg.MessageMediaDocument); ok {
-				if doc, ok := media.Document.(*tg.Document); ok {
-					if isAudioFile(doc) {
-						fileName := getFileName(doc)
-						if strings.HasSuffix(strings.ToLower(fileName), ".mp3") {
-							// Обработка MP3
-							downloadPath := fmt.Sprintf("downloads/%d.mp3", doc.ID)
-							if _, err := downloadFile(api, doc, downloadPath); err != nil {
-								return errors.Wrap(err, "download mp3")
-							}
-							oggPath := fmt.Sprintf("ogg_files/%d.ogg", doc.ID)
-							if err := convertMp3ToOgg(downloadPath, oggPath); err != nil {
-								return errors.Wrap(err, "convert mp3 to ogg")
-							}
-							if err := sendVoice(api, workChat, oggPath); err != nil {
-								return errors.Wrap(err, "send voice")
-							}
-						} else if strings.HasSuffix(strings.ToLower(fileName), ".ogg") {
-							// Обработка OGG
-							oggPath := fmt.Sprintf("ogg_files/%d.ogg", doc.ID)
-							if _, err := downloadFile(api, doc, oggPath); err != nil {
-								return errors.Wrap(err, "download ogg")
-							}
-							if err := sendVoice(api, workChat, oggPath); err != nil {
-								return errors.Wrap(err, "send voice")
-							}
-						}
-					}
-				}
-			}
-
-			// Обработка ответов на голосовые сообщения
-			if {
-				repliedMsg, err := getMessage(api, workChat, msg.ReplyTo)
-				if err != nil {
-					return errors.Wrap(err, "get replied message")
-				}
-				if repliedMedia, ok := repliedMsg.Media.(*tg.MessageMediaDocument); ok {
-					if repliedDoc, ok := repliedMedia.Document.(*tg.Document); ok {
-						if isVoiceMessage(repliedDoc) {
-							if err := sendVoiceWithCaption(api, workChat, repliedDoc, msg.Message); err != nil {
-								return errors.Wrap(err, "send voice with caption")
-							}
-						}
-					}
-				}
-			}
+		err = messageHandler(msg, api, e)
+		if err != nil {
+			fmt.Println(err)
 		}
-		return nil
+		return err
 	})
 
-	// Аутентификация
-	flow := auth.NewFlow(Terminal{PhoneNumber: phone}, auth.SendCodeOptions{})
+	/*dispatcher.OnNewMessage(func(ctx context.Context, e tg.Entities, u *tg.UpdateNewMessage) error {
+		fmt.Println("New Message", u.Message)
+
+		msg, ok := u.Message.(*tg.Message)
+		if !ok {
+			return nil
+		}
+
+		return messageHandler(msg, api)
+	})*/
+
 	return waiter.Run(ctx, func(ctx context.Context) error {
 		return client.Run(ctx, func(ctx context.Context) error {
-			if err := client.Auth().IfNecessary(ctx, flow); err != nil {
-				return errors.Wrap(err, "auth")
+			authStatus, err := client.Auth().Status(ctx)
+
+			if err != nil {
+				return errors.Wrap(err, "get auth status")
 			}
+
+			if !authStatus.Authorized {
+				_, err := client.QR().Auth(ctx, qrlogin.OnLoginToken(dispatcher), func(ctx context.Context, token qrlogin.Token) error {
+					qr, err := qrcode.New(token.URL(), qrcode.Medium)
+
+					if err != nil {
+						return err
+					}
+
+					code := qr.ToSmallString(false)
+					lines := strings.Count(code, "\n")
+
+					fmt.Print(code)
+					fmt.Print(strings.Repeat(text.CursorUp.Sprint(), lines))
+					return nil
+				})
+
+				if err != nil {
+					if !tgerr.Is(err, "SESSION_PASSWORD_NEEDED") {
+						return fmt.Errorf("qr auth: %w", err)
+					}
+
+					fmt.Print("Введите облачный пароль: ")
+					password, err := term.ReadPassword(int(os.Stdin.Fd()))
+					if err != nil {
+						return fmt.Errorf("failed to read password: %w", err)
+					}
+
+					passwordStr := strings.TrimSpace(string(password))
+					fmt.Println(passwordStr)
+
+					if _, err = client.Auth().Password(ctx, passwordStr); err != nil {
+						return fmt.Errorf("password auth: %w", err)
+					}
+				}
+			}
+
 			self, err := client.Self(ctx)
 			if err != nil {
 				return errors.Wrap(err, "call self")
@@ -261,6 +319,11 @@ func isAudioFile(doc *tg.Document) bool {
 
 func isVoiceMessage(doc *tg.Document) bool {
 	for _, attr := range doc.Attributes {
+		audioAttr, ok := attr.(*tg.DocumentAttributeAudio)
+		fmt.Println(audioAttr, ok)
+	}
+
+	for _, attr := range doc.Attributes {
 		if audioAttr, ok := attr.(*tg.DocumentAttributeAudio); ok && audioAttr.Voice {
 			return true
 		}
@@ -278,6 +341,11 @@ func getFileName(doc *tg.Document) string {
 }
 
 func downloadFile(api *tg.Client, doc *tg.Document, path string) (tg.StorageFileTypeClass, error) {
+	// Создаём директорию для скачиваний, если она не существует
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return nil, fmt.Errorf("failed to create download directory: %w", err)
+	}
+
 	location := &tg.InputDocumentFileLocation{
 		ID:            doc.ID,
 		AccessHash:    doc.AccessHash,
@@ -288,14 +356,37 @@ func downloadFile(api *tg.Client, doc *tg.Document, path string) (tg.StorageFile
 }
 
 func convertMp3ToOgg(inputPath, outputPath string) error {
-	if err := os.MkdirAll(filepath.Dir(outputPath), 0700); err != nil {
-		return err
+	// Проверяем, существует ли файл outputPath
+	if _, err := os.Stat(outputPath); err == nil {
+		// Файл существует, возвращаем nil
+		return nil
+	} else if !os.IsNotExist(err) {
+		// Если ошибка не связана с отсутствием файла, возвращаем её
+		return fmt.Errorf("failed to check output file: %w", err)
 	}
+
+	// Создаём директорию для outputPath, если она не существует
+	if err := os.MkdirAll(filepath.Dir(outputPath), 0700); err != nil {
+		return fmt.Errorf("failed to create output directory: %w", err)
+	}
+
+	// Выполняем конвертацию с помощью ffmpeg
 	cmd := exec.Command("ffmpeg", "-i", inputPath, "-c:a", "libopus", outputPath)
-	return cmd.Run()
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to convert mp3 to ogg: %w", err)
+	}
+
+	return nil
 }
 
-func sendVoice(api *tg.Client, chatID int64, oggPath string) error {
+func sendVoice(api *tg.Client, e tg.Entities, chatID int64, oggPath string) error {
+	var accessHash int64
+	for _, channel := range e.Channels {
+		if channel.ID == workChat {
+			accessHash = channel.AccessHash
+		}
+	}
+
 	file, err := os.Open(oggPath)
 	if err != nil {
 		return err
@@ -309,28 +400,41 @@ func sendVoice(api *tg.Client, chatID int64, oggPath string) error {
 	if err != nil {
 		return err
 	}
-
 	attributes := []tg.DocumentAttributeClass{
 		&tg.DocumentAttributeAudio{Voice: true},
 	}
-	media := &tg.InputMediaUploadedDocument{
+	media := tg.InputMediaUploadedDocument{
 		File:       uploadedFile,
 		Attributes: attributes,
+		MimeType:   "audio/ogg",
 	}
-
 	_, err = api.MessagesSendMedia(context.Background(), &tg.MessagesSendMediaRequest{
-		Peer:  &tg.InputPeerChat{ChatID: chatID},
-		Media: media,
+		Peer:     &tg.InputPeerChannel{ChannelID: chatID, AccessHash: accessHash},
+		Media:    &media,
+		RandomID: rand.Int63(),
 	})
 	return err
 }
 
-func getMessage(api *tg.Client, chatID int64, msgID int) (*tg.Message, error) {
-	resp, err := api.MessagesGetMessages(context.Background(), []tg.InputMessageClass{&tg.InputMessageID{ID: msgID}})
+func getMessage(api *tg.Client, e tg.Entities, msgID int) (*tg.Message, error) {
+	var accessHash int64
+	for _, channel := range e.Channels {
+		if channel.ID == workChat {
+			accessHash = channel.AccessHash
+		}
+	}
+
+	resp, err := api.ChannelsGetMessages(
+		context.Background(),
+		&tg.ChannelsGetMessagesRequest{
+			Channel: &tg.InputChannel{ChannelID: workChat, AccessHash: accessHash},
+			ID:      []tg.InputMessageClass{&tg.InputMessageID{ID: msgID}},
+		},
+	)
 	if err != nil {
 		return nil, err
 	}
-	messages := resp.(*tg.MessagesMessages).GetMessages()
+	messages := resp.(*tg.MessagesChannelMessages).GetMessages()
 	for _, m := range messages {
 		if msg, ok := m.(*tg.Message); ok {
 			return msg, nil
@@ -339,7 +443,14 @@ func getMessage(api *tg.Client, chatID int64, msgID int) (*tg.Message, error) {
 	return nil, fmt.Errorf("message not found")
 }
 
-func sendVoiceWithCaption(api *tg.Client, chatID int64, doc *tg.Document, caption string) error {
+func sendVoiceWithCaption(api *tg.Client, e tg.Entities, chatID int64, doc *tg.Document, caption string, entities []tg.MessageEntityClass) error {
+	var accessHash int64
+	for _, channel := range e.Channels {
+		if channel.ID == workChat {
+			accessHash = channel.AccessHash
+		}
+	}
+
 	media := &tg.InputMediaDocument{
 		ID: &tg.InputDocument{
 			ID:            doc.ID,
@@ -348,9 +459,11 @@ func sendVoiceWithCaption(api *tg.Client, chatID int64, doc *tg.Document, captio
 		},
 	}
 	_, err := api.MessagesSendMedia(context.Background(), &tg.MessagesSendMediaRequest{
-		Peer:    &tg.InputPeerChat{ChatID: chatID},
-		Media:   media,
-		Message: caption,
+		Peer:     &tg.InputPeerChannel{ChannelID: chatID, AccessHash: accessHash},
+		Media:    media,
+		Message:  caption,
+		Entities: entities,
+		RandomID: rand.Int63(),
 	})
 	return err
 }
